@@ -12,10 +12,11 @@ export default function Checkout() {
       const res = await fetch("/api/checkout", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({}), // supply { priceId, quantity } if needed
+        // Add { priceId, quantity } here if you want to override env defaults
+        body: JSON.stringify({}),
       });
 
-      // res.status is a NUMBER, not a function
+      // res.status is a NUMBER (use res.ok / res.status, not res.status())
       if (!res.ok) {
         const body = await res.json().catch(() => ({}));
         throw new Error(body?.error || `HTTP ${res.status}`);
@@ -36,7 +37,7 @@ export default function Checkout() {
     <main style={{ padding: 24, maxWidth: 600 }}>
       <h1>Checkout</h1>
       <p>Click below to start Stripe Checkout.</p>
-      <button onClick={startCheckout} disabled={loading}>
+      <button type="button" onClick={startCheckout} disabled={loading} aria-busy={loading}>
         {loading ? "Redirecting…" : "Buy"}
       </button>
       {error && <p style={{ color: "crimson" }}>{error}</p>}

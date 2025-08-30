@@ -1,52 +1,70 @@
-// pages/checkout.js
-import { useState } from "react";
+// pages/api/checkout.js
+import Stripe from "stripe";
 
-export default function Checkout() {
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState("");
-
-  async function startCheckout() {
-    setLoading(true);
-    setError("");
-    try {
-      const res = await fetch("/api/checkout", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        // Optionally pass a specific priceId/qty:
-        // body: JSON.stringify({ priceId: "<price_...>", quantity: 1 }),
-        body: JSON.stringify({}),
-      });
-
-      // res.status is a NUMBER, not a function
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
-        throw new Error(body?.error || `HTTP ${res.status}`);
-      }
-
-      const { url } = await res.json();
-      if (!url) throw new Error("No checkout URL returned");
-      window.location.href = url;
-    } catch (e) {
-      console.error(e);
-      setError(e.message || "Checkout failed");
-    } finally {
-      setLoading(false);
-    }
+export default async function handler(req, res) {
+  if (req.method !== "POST") {
+    return res.status(405).json({ error: "Method not allowed" });
   }
 
-  return (
-    <main style={{ padding: 24, maxWidth: 600 }}>
-      <h1>Checkout</h1>
-      <p>Click below to start Stripe Checkout.</p>
-      <button onClick={startCheckout} disabled={loading}>
-        {loading ? "Redirecting…" : "Buy"}
-      </button>
-      {error && <p style={{ color: "crimson" }}>{error}</p>}
-    </main>
-  );
-}
+  try {
+    const secretKey = process.env.STRIPE_SECRET_KEY;
+    if (!secretKey) {
+      return res.status(500).json({ error: "STRIPE_SECRET_KEY is missing" });
+    }
+    const stripe = new Stripe(secretKey, { apiVersion: "2024-06-20" });
 
-// Force runtime rendering so Next doesn't try to prerender this page at build time
-export async function getServerSideProps() {
-  return { props: {} };
+    const {
+      priceId = process.env.STRIPE_PRICE_ID, // can override from client
+      quantity = 1,
+      metadata = {},
+      mode, // optional: "payment" | "subscription"
+    } = req.body || {};
+
+    if (!priceId) {
+      return res
+        .status(400)
+        .json({ error: "Missing priceId (or STRIPE_PRICE_ID env)" });
+    }
+
+    // Inspect price to infer mode if not provided
+    const price = await stripe.prices.retrieve(priceId);
+    const isRecurring = !!price.recurring;
+    const inferredMode = isRecurring ? "subscription" : "payment";
+
+    if (mode && mode !== "payment" && mode !== "subscription") {
+      return res.status(400).json({ error: "mode must be 'payment' or 'subscription'" });
+    }
+    if (mode === "payment" && isRecurring) {
+      return res.status(400).json({
+        error: "You passed a recurring price with mode 'payment'. Use mode 'subscription' or a one-time price.",
+      });
+    }
+    if (mode === "subscription" && !isRecurring) {
+      return res.status(400).json({
+        error: "You passed a one-time price with mode 'subscription'. Use mode 'payment' or a recurring price.",
+      });
+    }
+
+    const sessionMode = mode || inferredMode;
+
+    // Base URL for redirects (works locally & on Vercel)
+    const inferredOrigin =
+      (req.headers["x-forwarded-proto"] ? `${req.headers["x-forwarded-proto"]}://` : "http://") +
+      req.headers.host;
+    const baseUrl = process.env.NEXT_PUBLIC_BASE_URL || inferredOrigin;
+
+    const session = await stripe.checkout.sessions.create({
+      mode: sessionMode,
+      line_items: [{ price: priceId, quantity }],
+      success_url: `${baseUrl}/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${baseUrl}/cancelled`,
+      metadata,
+    });
+
+    return res.status(200).json({ id: session.id, url: session.url });
+  } catch (e) {
+    const msg = e?.raw?.message || e?.message || "Server error creating checkout session";
+    console.error("Checkout error:", e);
+    return res.status(500).json({ error: msg });
+  }
 }

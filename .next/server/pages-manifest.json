@@ -1,1 +1,10 @@
-{}
+{
+  "/_app": "pages/_app.js",
+  "/_error": "pages/_error.js",
+  "/_document": "pages/_document.js",
+  "/generate": "pages/generate.js",
+  "/": "pages/index.js",
+  "/pricing": "pages/pricing.js",
+  "/api/me/balance": "pages/api/me/balance.js",
+  "/api/checkout-upgrade": "pages/api/checkout-upgrade.js"
+}
