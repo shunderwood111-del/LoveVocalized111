@@ -4,8 +4,13 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
+    "prebuild": "prisma generate",
     "build": "next build",
+    "postinstall": "prisma generate",
     "start": "next start"
+  },
+  "engines": {
+    "node": "18.x"
   },
   "dependencies": {
     "@prisma/client": "^6.14.0",
