@@ -1,131 +1,63 @@
-// pages/api/songs/status.js
-import prisma from "../../../lib/prisma";
-
-const SUCCESS_STATES = new Set(["succeeded", "success", "completed", "done"]);
-const FAILURE_STATES = new Set(["failed", "error", "cancelled", "canceled"]);
-
-// Try a bunch of shapes seen in providers; include Mureka's choices[ ] shape.
-function pickResultUrl(obj) {
-  if (!obj || typeof obj !== "object") return null;
-
-  // common top-level fields
-  if (obj.audio_url) return obj.audio_url;
-  if (obj.result_url) return obj.result_url;
-  if (obj.url) return obj.url;
-
-  // nested result object
-  if (obj.result) {
-    const r = pickResultUrl(obj.result);
-    if (r) return r;
-  }
-
-  // Mureka often returns an array: choices: [{ audio_url, url, ... }]
-  if (Array.isArray(obj.choices) && obj.choices.length > 0) {
-    for (const ch of obj.choices) {
-      const r = pickResultUrl(ch);
-      if (r) return r;
-    }
-  }
-
-  // sometimes wrapped in data
-  if (Array.isArray(obj.data) && obj.data.length > 0) {
-    for (const it of obj.data) {
-      const r = pickResultUrl(it);
-      if (r) return r;
-    }
-  }
-
-  return null;
-}
+﻿export const config = { runtime: "nodejs" };
+import prisma from "../../../lib/prisma.js";
+import { persistSong } from "../../../lib/persistSong.js";
 
 export default async function handler(req, res) {
-  if (req.method !== "GET") return res.status(405).end("Method Not Allowed");
-
-  const { jobId } = req.query;
-  if (!jobId) return res.status(400).json({ error: "Missing jobId" });
+  if (req.method !== "POST") return res.status(405).json({ error: "Method Not Allowed" });
 
   try {
-    // 1) Load local job
-    const job = await prisma.songJob.findUnique({ where: { externalJob: jobId.toString() } });
+    const { jobId } = req.body || {};
+    if (!jobId) return res.status(400).json({ error: "Missing jobId" });
+
+    const job = await prisma.songJob.findUnique({ where: { id: jobId } });
     if (!job) return res.status(404).json({ error: "Job not found" });
 
-    // 2) Query Mureka
-    const base = process.env.MUREKA_API_URL || "https://api.mureka.ai";
-    const key = process.env.MUREKA_API_KEY;
-    if (!key) return res.status(500).json({ error: "Mureka not configured" });
-
-    const resp = await fetch(`${base}/v1/song/query/${encodeURIComponent(jobId)}`, {
-      headers: { Authorization: `Bearer ${key}` },
+    // EDIT THIS to your provider’s status endpoint + auth
+    const resp = await fetch(`${process.env.MUREKA_API_URL}/v1/jobs/${job.externalJob}`, {
+      headers: { Authorization: `Bearer ${process.env.MUREKA_API_KEY}` },
     });
+    const payload = await resp.json();
 
-    const text = await resp.text();
-    if (!resp.ok) {
-      return res.status(resp.status).json({ error: "Mureka status failed", detail: text });
-    }
+    // 👀 Log the provider payload so you can map exact fields
+    console.log("songs/status provider payload:", payload);
 
-    let data;
-    try {
-      data = JSON.parse(text);
-    } catch {
-      return res.status(502).json({ error: "Bad JSON from Mureka", raw: text });
-    }
+    // Map fields (adjust after you see logs above)
+    const providerStatus = payload?.status;                 // e.g. "succeeded"
+    const tempResultUrl  = payload?.output?.url;            // temporary audio file
+    const mime           = payload?.output?.mime || "audio/mpeg";
+    const durationSec    = payload?.meta?.duration;
 
-    const remoteStatus = (data?.status || "").toString().toLowerCase();
-    const resultUrl = pickResultUrl(data);
-
-    // 3) Update local job with latest info
-    let updated = await prisma.songJob.update({
-      where: { externalJob: jobId.toString() },
-      data: {
-        status: remoteStatus || job.status,
-        ...(resultUrl ? { resultUrl } : {}),
-      },
-    });
-
-    // 4) On success, decrement entitlement exactly once
-    let nowConsumed = updated.consumed;
-    if (SUCCESS_STATES.has(remoteStatus) && !updated.consumed) {
-      const ent = await prisma.customerEntitlement.findUnique({
-        where: { customerId: updated.customerId },
-      });
-      if (ent) {
-        if (ent.songsPerYear >= 0) {
-          const remaining = Math.max(0, ent.songsPerYear - (ent.songsUsed ?? 0));
-          if (remaining > 0) {
-            await prisma.customerEntitlement.update({
-              where: { customerId: updated.customerId },
-              data: { songsUsed: { increment: 1 } },
-            });
-          }
-        }
-        updated = await prisma.songJob.update({
-          where: { externalJob: jobId.toString() },
-          data: { consumed: true },
-        });
-        nowConsumed = true; // reflect in response
+    if (providerStatus === "succeeded") {
+      if (job.storageKey) {
+        return res.status(200).json({ ok: true, status: "succeeded", storageKey: job.storageKey });
       }
+      if (!tempResultUrl) {
+        return res.status(500).json({ error: "Provider succeeded but no tempResultUrl" });
+      }
+
+      const key = await persistSong({
+        jobId: job.id,
+        tempUrl: tempResultUrl,
+        customerId: job.customerId,
+        mime,
+      });
+
+      await prisma.songJob.update({
+        where: { id: job.id },
+        data: { durationSec, resultUrl: null },
+      });
+
+      return res.status(200).json({ ok: true, status: "succeeded", storageKey: key });
     }
 
-    // 5) Build response
-    const payload = {
-      jobId,
-      status: remoteStatus || updated.status,
-      consumed: nowConsumed,
-      resultUrl: resultUrl || updated.resultUrl || null,
-      raw: data,
-    };
+    if (providerStatus === "failed") {
+      await prisma.songJob.update({ where: { id: job.id }, data: { status: "failed" } });
+      return res.status(200).json({ ok: true, status: "failed" });
+    }
 
-    return res.status(200).json(payload);
+    return res.status(200).json({ ok: true, status: providerStatus || "pending" });
   } catch (e) {
-    console.error("songs/status error", e);
-    return res.status(500).json({ error: "Server error" });
+    console.error("songs/status error:", e);
+    return res.status(500).json({ error: e.message || "Internal error" });
   }
-}
-import { consumeIfNeeded } from "../../../lib/consumeOnSuccess.js";
-
-// ...inside your handler, after you computed `status`, `customerId`, and you know `status === "succeeded"`:
-try {
-  await consumeIfNeeded({ customerId, externalJob: jobId }); // jobId is the one the client polls with
-} catch (e) {
-  console.error("consumeIfNeeded failed:", e);
 }
