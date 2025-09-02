@@ -34,4 +34,10 @@ CREATE TABLE "public"."SongJob" (
 CREATE UNIQUE INDEX "CustomerEntitlement_customerId_key" ON "public"."CustomerEntitlement"("customerId");
 
 -- CreateIndex
+CREATE INDEX "CustomerEntitlement_customerId_idx" ON "public"."CustomerEntitlement"("customerId");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "SongJob_externalJob_key" ON "public"."SongJob"("externalJob");
+
+-- CreateIndex
 CREATE INDEX "SongJob_customerId_idx" ON "public"."SongJob"("customerId");
