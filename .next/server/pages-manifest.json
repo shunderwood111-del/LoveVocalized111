@@ -3,6 +3,8 @@
   "/_error": "pages/_error.js",
   "/_document": "pages/_document.js",
   "/": "pages/index.js",
+  "/api/checkout": "pages/api/checkout.js",
+  "/success": "pages/success.js",
   "/generate": "pages/generate.js",
-  "/pricing": "pages/pricing.js"
+  "/api/songs/start": "pages/api/songs/start.js"
 }
