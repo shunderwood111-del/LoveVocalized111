@@ -5,39 +5,46 @@ generator client {
 }
 
 datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
   directUrl = env("DIRECT_URL")
 }
 
 model CustomerEntitlement {
   id               String    @id @default(cuid())
-  customerId       String    @unique        // Stripe Customer ID (e.g. cus_***)
-  priceId          String                   // Stripe Price ID purchased
-  planName         String                   // Human-friendly name of plan
-  songsPerYear     Int                      // Allowance
-  revisionsPerSong Int                      // Allowance
-  commercial       Boolean                  // Commercial usage flag
-  renewsAt         DateTime?                // Next renewal (if subscription)
-  songsUsed        Int       @default(0)    // Consumption counter
+  customerId       String    @unique // Stripe Customer ID (e.g. cus_***)
+  priceId          String // Stripe Price ID purchased
+  planName         String // Human-friendly name of plan
+  songsPerYear     Int // Allowance
+  revisionsPerSong Int // Allowance
+  commercial       Boolean // Commercial usage flag
+  renewsAt         DateTime? // Next renewal (if subscription)
+  songsUsed        Int       @default(0) // Consumption counter
 
-  createdAt        DateTime  @default(now())
-  updatedAt        DateTime  @updatedAt
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   @@index([customerId])
 }
 
 model SongJob {
-  id          String   @id @default(cuid())
+  id          String  @id @default(cuid())
   customerId  String
-  externalJob String   @unique            // ID from external job system
-  status      String   @default("pending") // pending | preparing | running | succeeded | failed
-  consumed    Boolean  @default(false)    // whether usage has been decremented
+  externalJob String  @unique
+  status      String  @default("pending") // keep as-is for now
+  consumed    Boolean @default(false)
   prompt      String?
-  resultUrl   String?
 
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  // NEW: store a permanent storage key (e.g., "songs/<customerId>/<jobId>.mp3")
+  storageKey  String? // <- use this going forward
+  mime        String? // e.g., "audio/mpeg"
+  durationSec Int?
+
+  // (legacy) temporary/signed URL from generator — will stop using later
+  resultUrl String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   @@index([customerId])
 }
