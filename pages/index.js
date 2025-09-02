@@ -1,4 +1,6 @@
 // pages/index.js
+import Link from "next/link";
+
 export default function Home() {
   // TEST price IDs you gave me
   const ONE_HIT  = "price_1RxfHhKhwtUF5XZpyewzUaoQ"; // $19.99/yr
@@ -33,6 +35,11 @@ export default function Home() {
       <h1>LoveVocalized</h1>
       <p>Turn life’s moments into songs — love notes, birthdays, weddings.</p>
 
+      {/* New: quick link to the user's songs */}
+      <p style={{ marginTop: 16 }}>
+        <Link href="/songs">🎵 View My Songs</Link>
+      </p>
+
       <div style={{ display: "grid", gap: 16, gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))" }}>
         <div style={{ border: "1px solid #eee", borderRadius: 12, padding: 16 }}>
           <h3>One-Hit Wonder</h3>
@@ -45,7 +52,12 @@ export default function Home() {
         </div>
 
         <div style={{ border: "1px solid #eee", borderRadius: 12, padding: 16 }}>
-          <h3>Greatest Hits <span style={{ fontSize: 12, padding: "2px 6px", background: "#eef2ff", borderRadius: 999, marginLeft: 6 }}>Most Popular</span></h3>
+          <h3>
+            Greatest Hits{" "}
+            <span style={{ fontSize: 12, padding: "2px 6px", background: "#eef2ff", borderRadius: 999, marginLeft: 6 }}>
+              Most Popular
+            </span>
+          </h3>
           <p><b>$29.99 / year</b></p>
           <ul>
             <li>Up to 5 romantic songs this year</li>
@@ -58,7 +70,7 @@ export default function Home() {
           <h3>Platinum Playlist</h3>
           <p><b>$99.99 / year</b></p>
           <ul>
-            <li>Unlimited songs & revisions</li>
+            <li>Unlimited songs &amp; revisions</li>
             <li>Full commercial license</li>
           </ul>
           <button onClick={() => startCheckout(PLATINUM)}>Go Platinum</button>
