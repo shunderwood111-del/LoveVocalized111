@@ -1,5 +1,6 @@
+// pages/success.js
 export default function Success() {
-  // This page won’t render; we redirect server-side in getServerSideProps.
+  // We redirect server-side; nothing to render.
   return null;
 }
 
@@ -7,13 +8,9 @@ export async function getServerSideProps(ctx) {
   const { session_id } = ctx.query || {};
 
   if (!session_id) {
-    // No session id? Send them to your generator (or home) as a safe fallback.
-    return {
-      redirect: { destination: "/generate", permanent: false },
-    };
+    return { redirect: { destination: "/generate", permanent: false } };
   }
 
-  // Look up the Stripe Checkout Session on the server
   const Stripe = (await import("stripe")).default;
   const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
     apiVersion: "2024-06-20",
@@ -30,22 +27,31 @@ export async function getServerSideProps(ctx) {
         : session.customer?.id;
 
     if (!customerId) {
-      return {
-        redirect: { destination: "/generate", permanent: false },
-      };
+      return { redirect: { destination: "/generate", permanent: false } };
     }
 
-    // Redirect straight to your generator with the customerId
+    // Set a non-HttpOnly cookie so client code can read it (e.g., /songs page).
+    // Add `Secure` only when we’re on HTTPS (Vercel).
+    const proto = ctx.req.headers["x-forwarded-proto"] || "http";
+    const isSecure = proto === "https";
+
+    const cookie = [
+      `lv_customer=${encodeURIComponent(customerId)}`,
+      "Path=/",
+      "Max-Age=2592000",         // ~30 days
+      "SameSite=Lax",
+      isSecure ? "Secure" : "",  // don’t set Secure during local HTTP dev
+    ]
+      .filter(Boolean)
+      .join("; ");
+
+    ctx.res.setHeader("Set-Cookie", cookie);
+
+    // Redirect to the songs library page
     return {
-      redirect: {
-        destination: `/generate?customerId=${encodeURIComponent(customerId)}`,
-        permanent: false,
-      },
+      redirect: { destination: "/songs", permanent: false },
     };
   } catch {
-    // Any failure → safe fallback
-    return {
-      redirect: { destination: "/generate", permanent: false },
-    };
+    return { redirect: { destination: "/generate", permanent: false } };
   }
 }
