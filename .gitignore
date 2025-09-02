@@ -1,16 +1,9 @@
-﻿# Node / Next.js
 node_modules/
 .next/
-out/
-dist/
-.vercel/
+.env
+.env.local
+.env.*
+prisma/.env
+*.log
 npm-debug.log*
-
-# Env files (keep secrets out of Git)
-.env*
-!.env.example
-
-# OS / editor
-.DS_Store
-Thumbs.db
-.vscode/
+yarn-error.log*
