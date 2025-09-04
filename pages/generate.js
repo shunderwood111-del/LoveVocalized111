@@ -1,5 +1,5 @@
 // pages/generate.js
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/router";
 
 const PURPOSES = {
@@ -11,9 +11,9 @@ const PURPOSES = {
 export default function Generate({ initialCustomerId, initialEnt }) {
   const router = useRouter();
 
-  // ---- Stable, SSR-provided values ----
+  // ---- SSR-provided values ----
   const [customerId, setCustomerId] = useState(initialCustomerId || "");
-  const [ent, setEnt] = useState(initialEnt); // { planName, songsPerYear, songsUsed, revisionsPerSong, commercial, renewsAt }
+  const [ent, setEnt] = useState(initialEnt); // { planName, songsPerYear, songsUsed, ... }
 
   // ---- Generation options ----
   const [lyrics, setLyrics] = useState("");
@@ -26,16 +26,12 @@ export default function Generate({ initialCustomerId, initialEnt }) {
   const [vocalId, setVocalId] = useState("");
   const [melodyId, setMelodyId] = useState("");
 
-  // ---- Job state ----
+  // ---- Job/UI state ----
   const [jobId, setJobId] = useState("");
   const [status, setStatus] = useState("");
   const [resultUrl, setResultUrl] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
-
-  // Polling refs (fixes stale-closure bug)
-  const pollRef = useRef(null);
-  const jobIdRef = useRef("");
 
   // Keep customerId in sync if URL changes client-side
   useEffect(() => {
@@ -45,16 +41,13 @@ export default function Generate({ initialCustomerId, initialEnt }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [router.isReady, router.query.customerId]);
 
-  // Keep jobIdRef synced with state
-  useEffect(() => {
-    jobIdRef.current = jobId;
-  }, [jobId]);
-
   // ---- Entitlement fetch (used after successful job) ----
   async function fetchEntitlement(id) {
     if (!id) return;
     try {
-      const r = await fetch(`/api/me/entitlement?customerId=${encodeURIComponent(id)}`);
+      const r = await fetch(`/api/me/entitlement?customerId=${encodeURIComponent(id)}`, {
+        cache: "no-store",
+      });
       const j = await r.json();
       if (!r.ok) throw new Error(j?.error || "Entitlement check failed");
 
@@ -85,7 +78,7 @@ export default function Generate({ initialCustomerId, initialEnt }) {
       fd.append("purpose", PURPOSES[fieldKey]);
       fd.append("file", file);
 
-      const r = await fetch("/api/mureka/upload", { method: "POST", body: fd });
+      const r = await fetch("/api/mureka/upload", { method: "POST", body: fd, cache: "no-store" });
       const j = await r.json();
       if (!r.ok) throw new Error(j?.detail || j?.error || "Upload failed");
 
@@ -97,7 +90,7 @@ export default function Generate({ initialCustomerId, initialEnt }) {
     }
   }
 
-  // ---- Start generation (sets up poller correctly) ----
+  // ---- Start generation (awaits poller; no setInterval) ----
   async function start() {
     setErr("");
     setResultUrl("");
@@ -130,88 +123,31 @@ export default function Generate({ initialCustomerId, initialEnt }) {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
+        cache: "no-store",
       });
       const j = await r.json();
       if (!r.ok) throw new Error(j?.detail || j?.error || "Failed to start");
 
       setJobId(j.jobId);
-      jobIdRef.current = j.jobId; // keep ref in sync immediately
       setStatus(j.status || "preparing");
 
-      // Start interval that always uses the latest jobId via ref
-      if (pollRef.current) clearInterval(pollRef.current);
-      pollRef.current = setInterval(() => check(jobIdRef.current), 2500);
+      // Wait until the job is done (status route polls provider + persists file)
+      setStatus("processing");
+      const done = await pollSongStatus(j.jobId);
+      setStatus(done.status || "succeeded");
+
+      // Optionally expose legacy resultUrl (if your status route still returns it)
+      if (done.resultUrl) setResultUrl(done.resultUrl);
+
+      // Refresh entitlement counters
+      await fetchEntitlement(customerId);
+
+      // Simple flow: send user to "My Songs"
+      window.location.href = "/songs";
     } catch (e) {
-      setErr(e.message);
+      setErr(e.message || "Generation failed");
     } finally {
       setBusy(false);
-    }
-  }
-
-  // ---- Poll job status (accepts explicit id; clears on terminal states) ----
-  async function check(idParam) {
-    const id = idParam || jobIdRef.current;
-    if (!id) return;
-
-    try {
-      const r = await fetch(`/api/songs/status?jobId=${encodeURIComponent(id)}`);
-      const j = await r.json();
-      if (!r.ok) throw new Error(j?.error || "Status failed");
-
-      setStatus(j.status);
-      if (j.resultUrl) setResultUrl(j.resultUrl);
-
-      if (["succeeded", "failed", "error"].includes(j.status)) {
-        if (pollRef.current) clearInterval(pollRef.current);
-        pollRef.current = null;
-        if (j.status === "succeeded") fetchEntitlement(customerId);
-      }
-    } catch (e) {
-      setErr(e.message);
-      if (pollRef.current) clearInterval(pollRef.current);
-      pollRef.current = null;
-    }
-  }
-
-  // Clear interval on unmount
-  useEffect(() => {
-    return () => {
-      if (pollRef.current) clearInterval(pollRef.current);
-    };
-  }, []);
-
-  // ---- Lyrics generator ----
-  const [lyrPrompt, setLyrPrompt] = useState(
-    "Birthday love song for Taylor, warm and heartfelt, mid-tempo pop"
-  );
-  const [genTitle, setGenTitle] = useState("");
-  const [genLyrics, setGenLyrics] = useState("");
-  const [genBusy, setGenBusy] = useState(false);
-  const [genErr, setGenErr] = useState("");
-
-  async function generateLyrics() {
-    setGenErr("");
-    setGenTitle("");
-    setGenLyrics("");
-    if (!lyrPrompt.trim()) {
-      setGenErr("Enter a lyrics prompt");
-      return;
-    }
-    setGenBusy(true);
-    try {
-      const r = await fetch("/api/mureka/lyrics", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt: lyrPrompt }),
-      });
-      const j = await r.json();
-      if (!r.ok) throw new Error(j?.detail || j?.error || "Lyrics generation failed");
-      setGenTitle(j.title || "");
-      setGenLyrics(j.lyrics || "");
-    } catch (e) {
-      setGenErr(e.message);
-    } finally {
-      setGenBusy(false);
     }
   }
 
@@ -274,39 +210,36 @@ export default function Generate({ initialCustomerId, initialEnt }) {
           }}
         >
           <b>Plan:</b> {ent.planName} &nbsp;|&nbsp;
-          <b>Songs/year:</b>{" "}
-          {ent.songsPerYear < 0 ? "Unlimited" : ent.songsPerYear} &nbsp;|&nbsp;
+          <b>Songs/year:</b> {ent.songsPerYear < 0 ? "Unlimited" : ent.songsPerYear} &nbsp;|&nbsp;
           <b>Used:</b> {ent.songsUsed} &nbsp;|&nbsp;
           <b>Remaining:</b> {remaining}
         </div>
       )}
 
       <div style={{ marginBottom: 16 }}>
-  <button
-    onClick={async () => {
-      try {
-        const r = await fetch("/api/portal", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ customerId }),
-        });
-        const j = await r.json();
-        if (j?.url) window.location.href = j.url;
-        else alert(j?.error || "Failed to open billing portal");
-      } catch (e) {
-        alert(e.message || "Failed to open billing portal");
-      }
-    }}
-    disabled={!customerId}
-  >
-    Manage Billing
-  </button>{" "}
-  {/* Upgrade always carries the customerId if we have it */}
-  <a href={pricingHref(customerId)} style={{ marginLeft: 8 }}>
-    Upgrade
-  </a>
-</div>
-
+        <button
+          onClick={async () => {
+            try {
+              const r = await fetch("/api/portal", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ customerId }),
+              });
+              const j = await r.json();
+              if (j?.url) window.location.href = j.url;
+              else alert(j?.error || "Failed to open billing portal");
+            } catch (e) {
+              alert(e.message || "Failed to open billing portal");
+            }
+          }}
+          disabled={!customerId}
+        >
+          Manage Billing
+        </button>{" "}
+        <a href={pricingHref(customerId)} style={{ marginLeft: 8 }}>
+          Upgrade
+        </a>
+      </div>
 
       {/* Lyrics Generator */}
       <section
@@ -333,8 +266,7 @@ export default function Generate({ initialCustomerId, initialEnt }) {
           </button>
           <button
             onClick={() => {
-              const combined =
-                (genTitle ? `# ${genTitle}\n\n` : "") + (genLyrics || "");
+              const combined = (genTitle ? `# ${genTitle}\n\n` : "") + (genLyrics || "");
               if (!combined.trim()) return;
               setLyrics(combined.trim());
               if (typeof window !== "undefined") {
@@ -346,9 +278,7 @@ export default function Generate({ initialCustomerId, initialEnt }) {
             Use in form
           </button>
         </div>
-        {genErr && (
-          <div style={{ color: "crimson", marginTop: 8 }}>Error: {genErr}</div>
-        )}
+        {genErr && <div style={{ color: "crimson", marginTop: 8 }}>Error: {genErr}</div>}
         {(genTitle || genLyrics) && (
           <div
             style={{
@@ -411,49 +341,31 @@ export default function Generate({ initialCustomerId, initialEnt }) {
           <legend>Optional Inputs via Upload</legend>
           <div style={{ display: "grid", gap: 12 }}>
             <div>
-              <div>
-                <b>Reference</b> (mp3/m4a ~30s)
-              </div>
+              <div><b>Reference</b> (mp3/m4a ~30s)</div>
               <input
                 type="file"
                 accept=".mp3,.m4a"
                 onChange={(e) => uploadFor("reference_id", e.target.files?.[0])}
               />
-              {referenceId && (
-                <div style={{ fontSize: 12, color: "#555" }}>
-                  reference_id: {referenceId}
-                </div>
-              )}
+              {referenceId && <div style={{ fontSize: 12, color: "#555" }}>reference_id: {referenceId}</div>}
             </div>
             <div>
-              <div>
-                <b>Vocal</b> (mp3/m4a 15–30s)
-              </div>
+              <div><b>Vocal</b> (mp3/m4a 15–30s)</div>
               <input
                 type="file"
                 accept=".mp3,.m4a"
                 onChange={(e) => uploadFor("vocal_id", e.target.files?.[0])}
               />
-              {vocalId && (
-                <div style={{ fontSize: 12, color: "#555" }}>
-                  vocal_id: {vocalId}
-                </div>
-              )}
+              {vocalId && <div style={{ fontSize: 12, color: "#555" }}>vocal_id: {vocalId}</div>}
             </div>
             <div>
-              <div>
-                <b>Melody</b> (mp3/m4a/MIDI 5–60s)
-              </div>
+              <div><b>Melody</b> (mp3/m4a/MIDI 5–60s)</div>
               <input
                 type="file"
                 accept=".mp3,.m4a,.mid,.midi"
                 onChange={(e) => uploadFor("melody_id", e.target.files?.[0])}
               />
-              {melodyId && (
-                <div style={{ fontSize: 12, color: "#555" }}>
-                  melody_id: {melodyId}
-                </div>
-              )}
+              {melodyId && <div style={{ fontSize: 12, color: "#555" }}>melody_id: {melodyId}</div>}
             </div>
           </div>
         </fieldset>
@@ -462,18 +374,14 @@ export default function Generate({ initialCustomerId, initialEnt }) {
           <button onClick={start} disabled={busy || !customerId || noSongsLeft}>
             {busy ? "Starting…" : noSongsLeft ? "No songs left" : "Start"}
           </button>
-          <button onClick={() => check(jobIdRef.current)} disabled={!jobId}>
-            Check Status
-          </button>
         </div>
 
-{noSongsLeft && (
-  <div style={{ color: "#a00" }}>
-    You’ve used all your songs for this plan.{" "}
-    <a href={pricingHref(customerId)}>Upgrade</a> or wait until renewal.
-  </div>
-)}
-
+        {noSongsLeft && (
+          <div style={{ color: "#a00" }}>
+            You’ve used all your songs for this plan.{" "}
+            <a href={pricingHref(customerId)}>Upgrade</a> or wait until renewal.
+          </div>
+        )}
 
         {jobId && (
           <div>
@@ -496,6 +404,11 @@ export default function Generate({ initialCustomerId, initialEnt }) {
           </div>
         )}
         {err && <div style={{ color: "crimson" }}>Error: {err}</div>}
+
+        <p style={{ marginTop: 8 }}>
+          After you hit “Start”, we’ll process your song. When ready, we’ll take you to{" "}
+          <a href="/songs">My Songs</a>.
+        </p>
       </div>
     </main>
   );
@@ -508,9 +421,7 @@ export async function getServerSideProps(ctx) {
   let initialEnt = null;
 
   if (customerId) {
-    // Import prisma ONLY on the server
     const prisma = (await import("../lib/prisma")).default;
-
     try {
       const row = await prisma.customerEntitlement.findUnique({
         where: { customerId: String(customerId) },
@@ -538,11 +449,45 @@ export async function getServerSideProps(ctx) {
     },
   };
 }
+
 function pricingHref(cid) {
   return cid ? `/pricing?customerId=${encodeURIComponent(cid)}` : "/pricing";
 }
-// somewhere visible on the /generate page:
-<p style={{ marginTop: 8 }}>
-  After you hit “Generate”, you can follow progress in{" "}
-  <a href="/songs">My Songs</a>.
-</p>
+
+// --- helper (outside component)
+async function pollSongStatus(
+  jobId,
+  { intervalMs = 1500, timeoutMs = 10 * 60 * 1000 } = {}
+) {
+  const start = Date.now();
+  while (true) {
+    const res = await fetch("/api/songs/status?_t=" + Date.now(), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jobId }),
+      cache: "no-store",
+      credentials: "same-origin",
+    }).catch((e) => {
+      throw new Error("Network error: " + (e?.message || "unknown"));
+    });
+
+    if (res.status === 304) {
+      await new Promise((r) => setTimeout(r, intervalMs));
+      continue;
+    }
+    if (!res.ok) {
+      const msg = await res.text().catch(() => "");
+      throw new Error(`Status ${res.status}: ${msg || "poll failed"}`);
+    }
+
+    const data = await res.json();
+    if (!data?.ok || !data?.job) throw new Error(data?.error || "Malformed status response");
+
+    const s = data.job.status;
+    if (s === "succeeded") return data.job;
+    if (s === "failed") throw new Error("Song generation failed");
+
+    if (Date.now() - start > timeoutMs) throw new Error("Timed out waiting for song");
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+}
