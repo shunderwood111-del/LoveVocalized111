@@ -541,3 +541,8 @@ export async function getServerSideProps(ctx) {
 function pricingHref(cid) {
   return cid ? `/pricing?customerId=${encodeURIComponent(cid)}` : "/pricing";
 }
+// somewhere visible on the /generate page:
+<p style={{ marginTop: 8 }}>
+  After you hit “Generate”, you can follow progress in{" "}
+  <a href="/songs">My Songs</a>.
+</p>

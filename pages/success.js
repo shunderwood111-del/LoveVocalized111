@@ -1,4 +1,4 @@
-// pages/success.js
+﻿// pages/success.js
 export default function Success() {
   // We redirect server-side; nothing to render.
   return null;
