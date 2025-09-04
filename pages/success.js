@@ -30,26 +30,26 @@ export async function getServerSideProps(ctx) {
       return { redirect: { destination: "/generate", permanent: false } };
     }
 
-    // Set a non-HttpOnly cookie so client code can read it (e.g., /songs page).
-    // Add `Secure` only when we’re on HTTPS (Vercel).
+    // Set a readable cookie for the UI
     const proto = ctx.req.headers["x-forwarded-proto"] || "http";
     const isSecure = proto === "https";
-
     const cookie = [
       `lv_customer=${encodeURIComponent(customerId)}`,
       "Path=/",
-      "Max-Age=2592000",         // ~30 days
+      "Max-Age=2592000", // ~30 days
       "SameSite=Lax",
-      isSecure ? "Secure" : "",  // don’t set Secure during local HTTP dev
+      isSecure ? "Secure" : "", // don't set Secure during local HTTP dev
     ]
       .filter(Boolean)
       .join("; ");
-
     ctx.res.setHeader("Set-Cookie", cookie);
 
-    // Redirect to the songs library page
+    // ✅ Redirect to your generator (keeps query param for backwards-compat)
     return {
-      redirect: { destination: "/songs", permanent: false },
+      redirect: {
+        destination: `/generate?customerId=${encodeURIComponent(customerId)}`,
+        permanent: false,
+      },
     };
   } catch {
     return { redirect: { destination: "/generate", permanent: false } };
