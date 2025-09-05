@@ -1,182 +1,147 @@
 ﻿// pages/api/songs/status.js
 import prisma from "../../../lib/prisma";
-import { persistSong } from "../../../lib/persistSong";
-import supabaseAdmin from "../../../lib/supabaseAdmin";
 
 export default async function handler(req, res) {
-  if (req.method !== "POST" && req.method !== "GET") {
-    return res.status(405).end("Method Not Allowed");
-  }
+  if (req.method !== "POST") return res.status(405).end();
 
-  const jobId =
-    (req.method === "GET" ? req.query.jobId : req.body?.jobId)?.toString();
-  if (!jobId) return res.status(400).json({ error: "Missing jobId" });
-
-  // Find our job (we save provider id in externalJob)
-  const job = await prisma.songJob.findUnique({
-    where: { externalJob: jobId },
-  });
-  if (!job) return res.status(404).json({ error: "Unknown jobId" });
-
-  // If we already finished, return a playable URL
-  if (job.status === "succeeded") {
-    let url = null;
-    if (job.storageKey) {
-      const { data, error } = await supabaseAdmin
-        .storage
-        .from("song-files")
-        .createSignedUrl(job.storageKey, 900);
-      if (!error) url = data.signedUrl;
-    } else if (job.resultUrl) {
-      url = job.resultUrl; // legacy
-    }
-
-    return res.status(200).json({
-      ok: true,
-      job: {
-        id: job.id,
-        externalJob: job.externalJob,
-        status: job.status,
-        storageKey: job.storageKey || null,
-        resultUrl: url || null,
-      },
-    });
-  }
-
-  // Otherwise, ask the provider for status
-  const base = process.env.MUREKA_API_URL || "https://api.mureka.ai";
-  const key = process.env.MUREKA_API_KEY;
-  if (!key) return res.status(500).json({ error: "Mureka not configured" });
+  // no cache (prevents 304s while polling)
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Expires", "0");
+  res.setHeader("ETag", Date.now().toString());
 
   try {
-    const path = process.env.MUREKA_STATUS_PATH || "/v1/song/status";
-    const u = new URL(path, base);
-    // Most providers accept ?id=JOB_ID; adjust if yours differs
-    u.searchParams.set("id", jobId);
+    const { jobId } = req.body || {};
+    if (!jobId) return res.status(400).json({ ok: false, error: "Missing jobId" });
 
-    const resp = await fetch(u.toString(), {
-      headers: { Authorization: `Bearer ${key}` },
+    // Look up our job so we know which customer to credit
+    const job = await prisma.songJob.findFirst({
+      where: { OR: [{ id: jobId }, { externalJob: jobId }] },
+      select: { id: true, externalJob: true, status: true, resultUrl: true, customerId: true },
+    });
+
+    // Proceed with provider status even if our DB row is missing,
+    // but we can only increment entitlement if we found the job.
+    const isFullUrl = typeof jobId === "string" && /^https?:\/\//i.test(jobId);
+    const queryUrl = isFullUrl
+      ? jobId
+      : `https://api.mureka.ai/v1/song/query/${encodeURIComponent(jobId)}`;
+
+    const r = await fetch(queryUrl, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${process.env.MUREKA_API_KEY}` },
       cache: "no-store",
     });
 
-    const text = await resp.text();
-    let payload = {};
-    try { payload = JSON.parse(text); } catch {}
+    const text = await r.text();
+    let data; try { data = JSON.parse(text); } catch { data = { raw: text }; }
 
-    if (!resp.ok) {
-      return res
-        .status(resp.status)
-        .json({ error: "Provider status failed", detail: text });
+    if (!r.ok) {
+      return res.status(r.status).json({
+        ok: false,
+        error: data?.detail || data?.error || "Mureka status failed",
+        data,
+      });
     }
 
-    // Try multiple common shapes for status + URL
-    const providerStatus =
-      payload.status ||
-      payload.state ||
-      payload.job_status ||
-      payload.result?.status ||
-      "unknown";
+    const status = data?.status || data?.state || data?.job_status || "unknown";
 
-    // If completed: persist the audio to Supabase Storage
-    if (["succeeded", "completed"].includes(providerStatus)) {
-      const tempUrl =
-        payload.url ||
-        payload.result?.url ||
-        payload.audio_url ||
-        payload.resultUrl ||
-        null;
-      const mime =
-        payload.mime || payload.contentType || "audio/mpeg";
-
-      if (tempUrl) {
-        try {
-          // Upload & mark succeeded + storageKey
-          await persistSong({
-            jobId: job.id,
-            tempUrl,
-            customerId: job.customerId,
-            mime,
-          });
-
-          // Return a signed URL for immediate playback
-          const updated = await prisma.songJob.findUnique({
-            where: { id: job.id },
-          });
-
-          let signed = null;
-          if (updated.storageKey) {
-            const { data, error } = await supabaseAdmin
-              .storage
-              .from("song-files")
-              .createSignedUrl(updated.storageKey, 900);
-            if (!error) signed = data.signedUrl;
-          }
-
-          return res.status(200).json({
-            ok: true,
-            job: {
-              id: updated.id,
-              externalJob: updated.externalJob,
-              status: updated.status,
-              storageKey: updated.storageKey,
-              resultUrl: signed, // short-lived signed URL for audio
-            },
-          });
-        } catch (e) {
-          // Fallback: keep a direct resultUrl if upload failed
-          await prisma.songJob.update({
-            where: { id: job.id },
-            data: { status: "succeeded", resultUrl: tempUrl },
-          });
-          return res.status(200).json({
-            ok: true,
-            job: {
-              id: job.id,
-              externalJob: job.externalJob,
-              status: "succeeded",
-              storageKey: null,
-              resultUrl: tempUrl,
-            },
-          });
+    // ----- find a playable URL (robust) -----
+    const pickFromFiles = (files) => {
+      if (!Array.isArray(files)) return null;
+      for (const f of files) {
+        if (typeof f?.url === "string") return f.url;
+        if (typeof f?.download_url === "string") return f.download_url;
+        if (typeof f?.signed_url === "string") return f.signed_url;
+        if (typeof f?.file_url === "string") return f.file_url;
+      }
+      return null;
+    };
+    const findUrlDeep = (root) => {
+      const seen = new Set();
+      const stack = [root];
+      const looksLikeUrl = (s) => /^https?:\/\/[^\s"'<>]+$/i.test(s);
+      const isAudioish = (k, v) =>
+        /audio|file|download|signed/i.test(k) ||
+        (typeof v === "string" && /\.(mp3|m4a|wav|aac|flac)(\?|#|$)/i.test(v));
+      while (stack.length) {
+        const node = stack.pop();
+        if (!node || typeof node !== "object") continue;
+        if (seen.has(node)) continue;
+        seen.add(node);
+        for (const [k, v] of Object.entries(node)) {
+          if (typeof v === "string" && looksLikeUrl(v) && isAudioish(k, v)) return v;
+          if (v && typeof v === "object") stack.push(v);
         }
-      } else {
-        // No URL in payload but says succeeded — mark it and return
+      }
+      return null;
+    };
+    const resultUrl =
+      data?.result?.audio_url ||
+      data?.audio_url ||
+      data?.result?.url ||
+      data?.url ||
+      data?.download_url ||
+      data?.file_url ||
+      data?.data?.url ||
+      data?.data?.download_url ||
+      data?.output?.url ||
+      data?.audio?.url ||
+      data?.result?.audio?.url ||
+      pickFromFiles(data?.files) ||
+      pickFromFiles(data?.result?.files) ||
+      findUrlDeep(data) ||
+      null;
+
+    // ----- update DB + increment entitlement exactly once on success -----
+    if (status === "succeeded" && resultUrl && job?.id && job?.customerId) {
+      // Only increment if this job wasn't already succeeded
+      const updated = await prisma.$transaction(async (tx) => {
+        const current = await tx.songJob.findUnique({ where: { id: job.id } });
+        if (current?.status !== "succeeded") {
+          await tx.songJob.update({
+            where: { id: job.id },
+            data: { status: "succeeded", resultUrl },
+          });
+          await tx.customerEntitlement.update({
+            where: { customerId: job.customerId },
+            data: { songsUsed: { increment: 1 } },
+          });
+          return { status: "succeeded", resultUrl };
+        } else {
+          // ensure we keep the URL if it was missing
+          if (!current.resultUrl && resultUrl) {
+            await tx.songJob.update({
+              where: { id: job.id },
+              data: { resultUrl },
+            });
+          }
+          return { status: "succeeded", resultUrl: current.resultUrl || resultUrl };
+        }
+      });
+
+      return res.status(200).json({ ok: true, job: updated, data });
+    }
+
+    // Non-terminal → just sync status (no entitlement increment)
+    if (job?.id && status && !["succeeded", "failed", "error"].includes(job.status)) {
+      if (status !== job.status) {
         await prisma.songJob.update({
           where: { id: job.id },
-          data: { status: "succeeded" },
-        });
-        return res.status(200).json({
-          ok: true,
-          job: {
-            id: job.id,
-            externalJob: job.externalJob,
-            status: "succeeded",
-            storageKey: null,
-            resultUrl: null,
-          },
+          data: { status: String(status) },
         });
       }
     }
 
-    // Not done yet — store intermediate status if it changed
-    if (providerStatus !== job.status && providerStatus !== "unknown") {
-      await prisma.songJob.update({
-        where: { id: job.id },
-        data: { status: providerStatus },
-      });
-    }
+    // If provider said succeeded but no URL yet, keep the client polling
+    const normalizedStatus = status === "succeeded" && !resultUrl ? "running" : status;
 
     return res.status(200).json({
       ok: true,
-      job: {
-        id: job.id,
-        externalJob: job.externalJob,
-        status: providerStatus || job.status || "unknown",
-        storageKey: job.storageKey || null,
-        resultUrl: job.resultUrl || null,
-    }});
-  } catch (e) {
-    console.error("songs/status error", e);
-    return res.status(500).json({ error: "Server error" });
+      job: { status: normalizedStatus, resultUrl },
+      data,
+    });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: String(err) });
   }
 }

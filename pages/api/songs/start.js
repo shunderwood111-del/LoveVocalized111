@@ -6,12 +6,9 @@ import { getEntitlementFromPriceId } from "../../../lib/entitlements";
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: "2024-06-20" });
 
 async function ensureEntitlement(customerId) {
-  // Try to find existing
   let ent = await prisma.customerEntitlement.findUnique({ where: { customerId } });
   if (ent) return ent;
 
-  // No entitlement? Look up active subscription in Stripe and derive one.
-  // We handle both single- and multi-item subs; take the first active item.
   const subs = await stripe.subscriptions.list({
     customer: customerId,
     status: "active",
@@ -22,18 +19,11 @@ async function ensureEntitlement(customerId) {
   const sub = subs.data?.[0];
   const item = sub?.items?.data?.[0];
   const priceId = item?.price?.id;
-
-  if (!priceId) {
-    // Could be incomplete or no active sub yet
-    throw new Error("No active subscription found for this customer");
-  }
+  if (!priceId) throw new Error("No active subscription found for this customer");
 
   const mapped = getEntitlementFromPriceId(priceId);
-  if (!mapped) {
-    throw new Error(`Unknown price mapping for ${priceId}`);
-  }
+  if (!mapped) throw new Error(`Unknown price mapping for ${priceId}`);
 
-  // Create entitlement row
   ent = await prisma.customerEntitlement.create({
     data: {
       customerId,
@@ -51,7 +41,16 @@ async function ensureEntitlement(customerId) {
 }
 
 export default async function handler(req, res) {
-  if (req.method !== "POST") return res.status(405).end("Method Not Allowed");
+  if (req.method !== "POST") {
+    res.status(405).end("Method Not Allowed");
+    return;
+  }
+
+  // prevent caching (avoids 304s during polling flows)
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Expires", "0");
+  res.setHeader("ETag", Date.now().toString());
 
   try {
     const {
@@ -65,30 +64,35 @@ export default async function handler(req, res) {
       stream = false,
     } = req.body || {};
 
-    if (!customerId) return res.status(400).json({ error: "Missing customerId" });
+    if (!customerId) {
+      res.status(400).json({ error: "Missing customerId" });
+      return;
+    }
     if (!lyrics && !prompt && !reference_id && !vocal_id && !melody_id) {
-      return res.status(400).json({ error: "Provide one of: lyrics, prompt, reference_id, vocal_id, melody_id" });
+      res.status(400).json({ error: "Provide at least one: lyrics, prompt, reference, vocal or melody." });
+      return;
     }
 
-    // 🔧 NEW: auto-provision entitlement if missing
     let ent;
     try {
       ent = await ensureEntitlement(customerId);
     } catch (e) {
-      // Surface helpful message to UI
-      return res.status(402).json({ error: "Entitlement not found", detail: e.message });
+      res.status(402).json({ error: "Entitlement not found", detail: e.message });
+      return;
     }
 
-    // check remaining quota
     const remaining = ent.songsPerYear < 0 ? -1 : Math.max(0, ent.songsPerYear - (ent.songsUsed ?? 0));
     if (remaining === 0) {
-      return res.status(402).json({ error: "No songs remaining" });
+      res.status(402).json({ error: "No songs remaining" });
+      return;
     }
 
-    // Call Mureka
-    const base = process.env.MUREKA_API_URL || "https://api.mureka.ai";
+    const base = (process.env.MUREKA_API_URL || "https://api.mureka.ai").replace(/\/+$/, "");
     const key = process.env.MUREKA_API_KEY;
-    if (!key) return res.status(500).json({ error: "Mureka not configured" });
+    if (!key) {
+      res.status(500).json({ error: "Mureka not configured" });
+      return;
+    }
 
     const payload = {
       lyrics,
@@ -111,27 +115,80 @@ export default async function handler(req, res) {
 
     const text = await resp.text();
     if (!resp.ok) {
-      return res.status(resp.status).json({ error: "Mureka enqueue failed", detail: text });
+      res.status(resp.status).json({ error: "Mureka enqueue failed", detail: text });
+      return;
     }
 
-    let data; try { data = JSON.parse(text); } catch { return res.status(502).json({ error: "Bad JSON from Mureka", raw: text }); }
+    let provider;
+    try { provider = JSON.parse(text); } catch { provider = { raw: text }; }
 
-    const jobId = data?.id?.toString();
-    const status = (data?.status || "preparing").toString();
-    if (!jobId) return res.status(502).json({ error: "Mureka response missing 'id'" });
+    // If provider immediately returns a final audio URL, finish now.
+    const directUrl =
+      provider?.url ||
+      provider?.audio_url ||
+      provider?.result?.url ||
+      provider?.data?.url ||
+      null;
+
+    if (directUrl) {
+      const job = await prisma.songJob.create({
+        data: {
+          customerId,
+          externalJob: "direct-" + Date.now(),
+          status: "succeeded",
+          prompt: prompt || null,
+          resultUrl: directUrl,
+        },
+      });
+      res.status(200).json({
+        jobId: job.externalJob,
+        status: "succeeded",
+        resultUrl: directUrl,
+        accepted: payload,
+        providerRaw: provider,
+      });
+      return;
+    }
+
+    // Otherwise, async job: prefer a poll/status URL if given
+    const jobIdCandidate =
+      provider?.id ?? provider?.job_id ?? provider?.jobId ?? provider?.task_id ?? provider?.data?.id ?? null;
+
+    const pollUrlCandidate =
+      provider?.status_url ?? provider?.statusUrl ?? provider?.poll_url ?? provider?.pollUrl ?? provider?.href ?? null;
+
+    const externalJob =
+      (typeof pollUrlCandidate === "string" && /^https?:\/\//i.test(pollUrlCandidate))
+        ? pollUrlCandidate
+        : (jobIdCandidate ? String(jobIdCandidate) : null);
+
+    if (!externalJob) {
+      res.status(502).json({
+        error: "Mureka response missing job id or poll URL",
+        providerRaw: provider,
+      });
+      return;
+    }
+
+    const status = String(provider?.status ?? provider?.state ?? "preparing");
 
     await prisma.songJob.create({
       data: {
         customerId,
-        externalJob: jobId,
+        externalJob,
         status,
         prompt: prompt || null,
       },
     });
 
-    return res.status(200).json({ jobId, status, accepted: payload });
+    res.status(200).json({
+      jobId: externalJob,
+      status,
+      accepted: payload,
+      providerRaw: provider,
+    });
   } catch (e) {
     console.error("songs/start error", e);
-    return res.status(500).json({ error: "Server error" });
+    res.status(500).json({ error: "Server error" });
   }
 }
